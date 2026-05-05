@@ -574,7 +574,7 @@ def emit_jsonl(event: dict, path: str) -> None:
     """Appends one JSON line to a JSONL log file, adding a UTC timestamp if not set."""
     event.setdefault("t", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     with open(path, "a") as f:
-        f.write(json.dumps(event) + "\n")
+        f.write(json.dumps(event, default=lambda o: o.item() if hasattr(o, 'item') else str(o)) + "\n")
         f.flush()
 
 
