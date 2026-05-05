@@ -1,7 +1,8 @@
 import json
 from logging import Logger
 import os
-from typing import Dict, List
+import time
+from typing import Dict, List, Optional
 
 import numpy as np
 import warnings
@@ -22,13 +23,16 @@ from chemprop.constants import MODEL_FILE_NAME
 from chemprop.data import get_class_sizes, get_data, MoleculeDataLoader, MoleculeDataset, set_cache_graph, split_data
 from chemprop.models import MoleculeModel
 from chemprop.nn_utils import param_count, param_count_all
-from chemprop.utils import build_optimizer, build_lr_scheduler, load_checkpoint, makedirs, \
+from chemprop.utils import build_optimizer, build_lr_scheduler, emit_jsonl, load_checkpoint, makedirs, \
     save_checkpoint, save_smiles_splits, load_frzn_model, multitask_mean
 
 
 def run_training(args: TrainArgs,
                  data: MoleculeDataset,
-                 logger: Logger = None) -> Dict[str, List[float]]:
+                 logger: Logger = None,
+                 log_path: Optional[str] = None,
+                 fold: int = 0,
+                 num_folds: int = 1) -> Dict[str, List[float]]:
     """
     Loads data, trains a Chemprop model, and returns test scores for the model checkpoint with the highest validation score.
 
@@ -241,6 +245,23 @@ def run_training(args: TrainArgs,
     if args.class_balance:
         debug(f'With class_balance, effective train size = {train_data_loader.iter_size:,}')
 
+    steps_per_epoch = len(train_data_loader)
+    run_start_time = time.time()
+
+    if log_path is not None:
+        emit_jsonl({
+            "event": "run_start",
+            "fold": fold,
+            "num_folds": num_folds,
+            "total_epochs": args.epochs,
+            "steps_per_epoch": steps_per_epoch,
+            "train_rows": len(train_data),
+            "val_rows": len(val_data),
+            "test_rows": len(test_data),
+            "batch_size": args.batch_size,
+            "lr": args.max_lr,
+        }, log_path)
+
     # Train ensemble of models
     for model_idx in range(args.ensemble_size):
         # Tensorboard writer
@@ -292,7 +313,7 @@ def run_training(args: TrainArgs,
         best_epoch, n_iter = 0, 0
         for epoch in trange(args.epochs):
             debug(f'Epoch {epoch}')
-            n_iter = train(
+            n_iter, epoch_train_loss = train(
                 model=model,
                 data_loader=train_data_loader,
                 loss_func=loss_func,
@@ -302,7 +323,10 @@ def run_training(args: TrainArgs,
                 n_iter=n_iter,
                 atom_bond_scaler=atom_bond_scaler,
                 logger=logger,
-                writer=writer
+                writer=writer,
+                epoch=epoch,
+                log_path=log_path,
+                fold=fold,
             )
             if isinstance(scheduler, ExponentialLR):
                 scheduler.step()
@@ -331,11 +355,32 @@ def run_training(args: TrainArgs,
 
             # Save model checkpoint if improved validation score
             mean_val_score = multitask_mean(val_scores[args.metric], metric=args.metric)
-            if args.minimize_score and mean_val_score < best_score or \
-                    not args.minimize_score and mean_val_score > best_score:
+            is_best = (args.minimize_score and mean_val_score < best_score) or \
+                      (not args.minimize_score and mean_val_score > best_score)
+
+            if log_path is not None:
+                emit_jsonl({
+                    "event": "epoch_end",
+                    "fold": fold,
+                    "epoch": epoch + 1,
+                    "global_step": n_iter // args.batch_size,
+                    "train_loss": round(float(epoch_train_loss), 6),
+                    "val_loss": round(float(mean_val_score), 6),
+                    "is_best": is_best,
+                    "elapsed_s": int(time.time() - run_start_time),
+                }, log_path)
+
+            if is_best:
                 best_score, best_epoch = mean_val_score, epoch
                 save_checkpoint(os.path.join(save_dir, MODEL_FILE_NAME), model, scaler, features_scaler,
                                 atom_descriptor_scaler, bond_descriptor_scaler, atom_bond_scaler, args)
+                if log_path is not None:
+                    emit_jsonl({
+                        "event": "checkpoint",
+                        "fold": fold,
+                        "epoch": epoch + 1,
+                        "path": os.path.join(save_dir, MODEL_FILE_NAME),
+                    }, log_path)
 
         # Evaluate on test set using model with best validation score
         info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
@@ -410,6 +455,16 @@ def run_training(args: TrainArgs,
         if args.show_individual_scores:
             for task_name, ensemble_score in zip(args.task_names, scores):
                 info(f'Ensemble test {task_name} {metric} = {ensemble_score:.6f}')
+
+    if log_path is not None:
+        emit_jsonl({
+            "event": "run_end",
+            "fold": fold,
+            "best_epoch": best_epoch + 1,
+            "best_val_loss": round(float(best_score), 6),
+            "total_steps": n_iter // args.batch_size,
+            "elapsed_s": int(time.time() - run_start_time),
+        }, log_path)
 
     # Save scores
     with open(os.path.join(args.save_dir, 'test_scores.json'), 'w') as f:

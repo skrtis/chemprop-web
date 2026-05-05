@@ -1,7 +1,8 @@
 from argparse import Namespace
 import csv
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
+import json
 import logging
 import os
 import pickle
@@ -567,6 +568,14 @@ def create_logger(name: str, save_dir: str = None, quiet: bool = False) -> loggi
         logger.addHandler(fh_q)
 
     return logger
+
+
+def emit_jsonl(event: dict, path: str) -> None:
+    """Appends one JSON line to a JSONL log file, adding a UTC timestamp if not set."""
+    event.setdefault("t", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    with open(path, "a") as f:
+        f.write(json.dumps(event) + "\n")
+        f.flush()
 
 
 def timeit(logger_name: str = None) -> Callable[[Callable], Callable]:

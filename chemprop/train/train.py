@@ -1,5 +1,5 @@
 import logging
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 from tensorboardX import SummaryWriter
@@ -13,6 +13,7 @@ from chemprop.args import TrainArgs
 from chemprop.data import MoleculeDataLoader, MoleculeDataset, AtomBondScaler
 from chemprop.models import MoleculeModel
 from chemprop.nn_utils import compute_gnorm, compute_pnorm, NoamLR
+from chemprop.utils import emit_jsonl
 
 
 def train(
@@ -26,7 +27,10 @@ def train(
     atom_bond_scaler: AtomBondScaler = None,
     logger: logging.Logger = None,
     writer: SummaryWriter = None,
-) -> int:
+    epoch: int = 0,
+    log_path: Optional[str] = None,
+    fold: int = 0,
+) -> Tuple[int, float]:
     """
     Trains a model for an epoch.
 
@@ -49,6 +53,9 @@ def train(
         loss_sum, iter_count = [0]*(len(args.atom_targets) + len(args.bond_targets)), 0
     else:
         loss_sum = iter_count = 0
+    epoch_loss_sum = 0.0
+    epoch_batch_count = 0
+    n_iter_epoch_start = n_iter
 
     for batch in tqdm(data_loader, total=len(data_loader), leave=False):
         # Prepare batch
@@ -175,6 +182,8 @@ def train(
 
             loss_sum = [x + y for x, y in zip(loss_sum, loss_multi_task)]
             iter_count += 1
+            epoch_loss_sum += float(sum(x.detach() for x in loss_multi_task))
+            epoch_batch_count += 1
 
             sum(loss_multi_task).backward()
         else:
@@ -215,6 +224,8 @@ def train(
 
             loss_sum += loss.item()
             iter_count += 1
+            epoch_loss_sum += loss.item()
+            epoch_batch_count += 1
 
             loss.backward()
         if args.grad_clip:
@@ -241,6 +252,16 @@ def train(
             lrs_str = ", ".join(f"lr_{i} = {lr:.4e}" for i, lr in enumerate(lrs))
             debug(f"Loss = {loss_avg:.4e}, PNorm = {pnorm:.4f}, GNorm = {gnorm:.4f}, {lrs_str}")
 
+            if log_path is not None:
+                emit_jsonl({
+                    "event": "step",
+                    "fold": fold,
+                    "epoch": epoch + 1,
+                    "step": (n_iter - n_iter_epoch_start) // args.batch_size,
+                    "global_step": n_iter // args.batch_size,
+                    "train_loss": round(float(loss_avg), 6),
+                }, log_path)
+
             if writer is not None:
                 writer.add_scalar("train_loss", loss_avg, n_iter)
                 writer.add_scalar("param_norm", pnorm, n_iter)
@@ -248,4 +269,5 @@ def train(
                 for i, lr in enumerate(lrs):
                     writer.add_scalar(f"learning_rate_{i}", lr, n_iter)
 
-    return n_iter
+    epoch_avg_loss = epoch_loss_sum / max(epoch_batch_count, 1)
+    return n_iter, epoch_avg_loss

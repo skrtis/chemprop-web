@@ -48,23 +48,28 @@ def check_not_demo(func: Callable) -> Callable:
 
 def progress_bar(args: TrainArgs, progress: mp.Value):
     """
-    Updates a progress bar displayed during training.
+    Updates a progress bar displayed during training by tailing train.log JSONL events.
 
     :param args: Arguments.
     :param progress: The current progress.
     """
-    # no code to handle crashes in model training yet, though
-    current_epoch = -1
-    while current_epoch < args.epochs - 1:
-        if os.path.exists(os.path.join(args.save_dir, 'verbose.log')):
-            with open(os.path.join(args.save_dir, 'verbose.log'), 'r') as f:
-                content = f.read()
-                if 'Epoch ' + str(current_epoch + 1) in content:
-                    current_epoch += 1
-                    progress.value = (current_epoch + 1) * 100 / args.epochs
-        else:
-            pass
-        time.sleep(0)
+    import json as _json
+    log_path = os.path.join(args.save_dir, 'train.log')
+    while True:
+        if os.path.exists(log_path):
+            with open(log_path) as f:
+                for line in f:
+                    try:
+                        ev = _json.loads(line)
+                        event = ev.get("event")
+                        if event == "epoch_end":
+                            progress.value = ev["epoch"] * 100 / args.epochs
+                        elif event == "run_end":
+                            progress.value = 100.0
+                            return
+                    except (_json.JSONDecodeError, KeyError):
+                        pass
+        time.sleep(1)
 
 
 def find_unused_path(path: str) -> str:
